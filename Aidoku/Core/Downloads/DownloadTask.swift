@@ -34,6 +34,13 @@ actor DownloadTask: Identifiable {
     private var failedPageNumbers: [Int] = []
     private var pages: [Page] = []
 
+    /// Chapters that currently have a download run in flight.
+    ///
+    /// Pausing does not stop page requests that already started, so a run can outlive a pause. Resuming
+    /// must not start a second run over the same staging directory, or the two runs delete each other's
+    /// pages and share one progress counter, which finishes the chapter early with pages missing.
+    private var activeChapterRuns: Set<ChapterIdentifier> = []
+
     private(set) var running: Bool = false
 
     private static let maxConcurrentPageTasks = 5
@@ -225,6 +232,10 @@ extension DownloadTask {
 
         let download = downloads[0]
         downloads[0].status = .downloading
+
+        // a run from before a pause is still working on this chapter, so let it finish instead of starting over
+        guard activeChapterRuns.insert(download.chapterIdentifier).inserted else { return }
+        defer { activeChapterRuns.remove(download.chapterIdentifier) }
 
         let tmpDirectory = cache.tmpDirectory(for: download.chapterIdentifier)
         tmpDirectory.removeItem() // remove in case it exists from a previous failed download
@@ -477,6 +488,13 @@ extension DownloadTask {
     private func handleChapterDownloadFinish(download: Download) async {
         let tmpDirectory = cache.tmpDirectory(for: download.chapterIdentifier)
 
+        // the counters can claim the chapter is done while page files are missing, so check the files themselves
+        // and keep an incomplete chapter as a failed download rather than archiving it as finished
+        for pageNumber in missingPageNumbers(in: tmpDirectory) where !failedPageNumbers.contains(pageNumber) {
+            failedPageNumbers.append(pageNumber)
+        }
+        failedPages = max(failedPages, failedPageNumbers.count)
+
         if failedPages == pages.count {
             // the entire chapter failed to download, skip adding to cache and cancel
             tmpDirectory.removeItem()
@@ -545,6 +563,22 @@ extension DownloadTask {
         failedPages = 0
         failedPageNumbers = []
         await next()
+    }
+
+    /// One-based numbers of the pages that should have a file in the staging directory but do not.
+    private func missingPageNumbers(in directory: URL) -> [Int] {
+        guard directory.exists, !pages.isEmpty else { return [] }
+        var present = Set<Int>()
+        for file in directory.contents {
+            let name = file.lastPathComponent
+            guard !name.hasSuffix(".desc.txt"), let number = Int(name.prefix { $0 != "." }) else { continue }
+            present.insert(number)
+        }
+        return pages.enumerated().compactMap { index, page in
+            // pages without any content never produce a file
+            let hasContent = page.imageURL != nil || page.base64 != nil || page.text != nil || page.image != nil
+            return hasContent && !present.contains(index + 1) ? index + 1 : nil
+        }
     }
 
     // store file with failed pages in failed download directory
