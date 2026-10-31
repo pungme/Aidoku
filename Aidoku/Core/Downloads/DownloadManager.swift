@@ -306,6 +306,12 @@ extension DownloadManager {
         invalidateDownloadedMangaCache()
     }
 
+    /// Picks up downloads the system paused while the app was in the background.
+    func resumeDownloadsPausedBySystem() async {
+        if AppSettings.downloads.downloadOnlyOnWifi.get(), Reachability.getConnectionType() != .wifi { return }
+        await queue.resumeIfPausedBySystem()
+    }
+
     func cancelDownload(for chapter: ChapterIdentifier) async {
         await queue.cancelDownload(for: chapter)
         // Invalidate cache since cancelled downloads may affect display

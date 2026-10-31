@@ -21,6 +21,8 @@ actor DownloadQueue {
     private var progressBlocks: [ChapterIdentifier: (Int, Int) -> Void] = [:]
 
     private var paused = false
+    /// The system ended the background task and paused the queue, rather than the user.
+    private var pausedBySystem = false
     private var registeredTask = false
     private var totalDownloads: Int = 0
     private var completedDownloads: Int = 0
@@ -82,6 +84,7 @@ actor DownloadQueue {
 
     func resume() async {
         paused = false
+        pausedBySystem = false
 
         if #available(iOS 26.0, *), AppSettings.downloads.background.get() {
             if bgTask == nil {
@@ -247,6 +250,18 @@ actor DownloadQueue {
 }
 
 extension DownloadQueue {
+    private func markPausedBySystem() {
+        pausedBySystem = true
+    }
+
+    /// Resumes downloads that were paused because the system ended the background task.
+    /// Downloads the user paused stay paused.
+    func resumeIfPausedBySystem() async {
+        guard paused, pausedBySystem else { return }
+        pausedBySystem = false
+        await DownloadManager.shared.resumeDownloads()
+    }
+
     private func setBackgroundTask(_ task: ProgressReporting?) {
         bgTask = task
         totalDownloads = queue.values.reduce(0) { $0 + $1.count }
@@ -266,6 +281,7 @@ extension DownloadQueue {
             task.expirationHandler = {
                 Task {
                     await DownloadManager.shared.pauseDownloads()
+                    await self.markPausedBySystem()
                     await self.setBackgroundTask(nil)
                 }
                 task.setTaskCompleted(success: false)
@@ -275,11 +291,10 @@ extension DownloadQueue {
                 await self.setBackgroundTask(task)
                 await self.initAndResumeTasks()
 
-                // wait until downloads complete
-                while true {
-                    if await self.queue.isEmpty {
-                        break
-                    }
+                // wait until downloads complete, checking once a second instead of spinning the cpu,
+                // which can get the app terminated while in the background
+                while await !self.queue.isEmpty {
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
                 }
 
                 await self.setBackgroundTask(nil)
